@@ -31,6 +31,105 @@ COMMON_COINS: dict[str, Coin] = {
     "ada": Coin("cardano", "ADA", "Cardano"),
 }
 
+GATE_SYMBOL_ALIASES = {
+    "bitcoin": "BTC",
+    "ethereum": "ETH",
+    "solana": "SOL",
+    "binancecoin": "BNB",
+    "ripple": "XRP",
+    "dogecoin": "DOGE",
+    "cardano": "ADA",
+}
+
+
+class GateClient:
+    """Gate public spot-market client. No API key is required."""
+
+    def __init__(self) -> None:
+        self.base_url = "https://api.gateio.ws/api/v4"
+        self.session: aiohttp.ClientSession | None = None
+
+    async def start(self) -> None:
+        if self.session is None or self.session.closed:
+            timeout = aiohttp.ClientTimeout(total=15)
+            self.session = aiohttp.ClientSession(
+                headers={"accept": "application/json"}, timeout=timeout
+            )
+
+    async def close(self) -> None:
+        if self.session and not self.session.closed:
+            await self.session.close()
+
+    async def _get(self, path: str, params: dict[str, Any] | None = None) -> Any:
+        await self.start()
+        assert self.session is not None
+        try:
+            async with self.session.get(f"{self.base_url}{path}", params=params) as response:
+                if response.status == 429:
+                    raise MarketError("Gate 请求过于频繁，请稍后再试。")
+                if response.status >= 400:
+                    raise MarketError(f"Gate 返回 HTTP {response.status}")
+                return await response.json()
+        except TimeoutError as exc:
+            raise MarketError("Gate 行情服务响应超时。") from exc
+        except aiohttp.ClientError as exc:
+            raise MarketError("暂时无法连接 Gate 行情服务。") from exc
+
+    def resolve_symbol(self, query: str) -> Coin:
+        normalized = query.strip().lower()
+        symbol = GATE_SYMBOL_ALIASES.get(normalized, normalized.upper())
+        if symbol.endswith("_USDT"):
+            symbol = symbol[:-5]
+        if not re.fullmatch(r"[A-Z0-9]{1,30}", symbol):
+            raise MarketError("币种格式不正确，请输入 Gate 交易代码，例如 BTC 或 BLESS。")
+        name = COMMON_COINS.get(normalized, Coin(symbol, symbol, symbol)).name
+        return Coin(symbol, symbol, name)
+
+    async def ticker(self, query: str) -> dict[str, Any]:
+        coin = self.resolve_symbol(query)
+        pair = f"{coin.symbol}_USDT"
+        data = await self._get("/spot/tickers", {"currency_pair": pair, "timezone": "utc0"})
+        if not data:
+            raise MarketError(f"Gate 现货没有找到 {pair} 交易对。")
+        item = data[0]
+
+        def number(key: str) -> float | None:
+            value = item.get(key)
+            return float(value) if value not in {None, ""} else None
+
+        return {
+            "id": coin.id,
+            "symbol": coin.symbol,
+            "name": coin.name,
+            "currency_pair": pair,
+            "quote_currency": "USDT",
+            "current_price": number("last"),
+            "price_change_percentage_24h": number("change_percentage"),
+            "high_24h": number("high_24h"),
+            "low_24h": number("low_24h"),
+            "total_volume": number("quote_volume"),
+        }
+
+    async def coin_markets(self, coins: list[str]) -> dict[str, dict[str, Any]]:
+        results: dict[str, dict[str, Any]] = {}
+        for query in dict.fromkeys(coins):
+            try:
+                results[query] = await self.ticker(query)
+            except MarketError:
+                if len(coins) == 1:
+                    raise
+        return results
+
+
+def extract_gate_symbols(message: str) -> list[str]:
+    """Extract explicit symbols from natural-language price questions."""
+    matches = re.findall(
+        r"(?i)(?<![a-z0-9])([a-z][a-z0-9]{1,29})"
+        r"(?=(?:(?:现在|目前)?的?)?(?:价格|行情|多少钱))",
+        message,
+    )
+    return list(dict.fromkeys(symbol.upper() for symbol in matches))[:5]
+
 
 class CoinGeckoClient:
     def __init__(self, api_key: str | None = None) -> None:

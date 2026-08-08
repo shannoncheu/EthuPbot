@@ -13,7 +13,7 @@ from .ai import AIUnavailable, ChatService
 from .charts import render_price_chart
 from .config import Settings
 from .database import Database, GuildConfig
-from .market import CoinGeckoClient, EtherscanClient, MarketError
+from .market import CoinGeckoClient, EtherscanClient, GateClient, MarketError, extract_gate_symbols
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +52,7 @@ class CryptoBot(discord.Client):
         self.tree = app_commands.CommandTree(self)
         self.db = Database(settings.database_path)
         self.market = CoinGeckoClient(settings.coingecko_api_key)
+        self.gate = GateClient()
         self.etherscan = EtherscanClient(settings.etherscan_api_key)
         self.chat = ChatService(
             settings.ai_api_key,
@@ -67,6 +68,7 @@ class CryptoBot(discord.Client):
     async def setup_hook(self) -> None:
         await self.db.initialize()
         await self.market.start()
+        await self.gate.start()
         self.scheduler.start()
 
     async def on_ready(self) -> None:
@@ -79,6 +81,7 @@ class CryptoBot(discord.Client):
         if self.scheduler.is_running():
             self.scheduler.cancel()
         await self.market.close()
+        await self.gate.close()
         await super().close()
 
     async def on_guild_join(self, guild: discord.Guild) -> None:
@@ -106,13 +109,16 @@ class CryptoBot(discord.Client):
 
         try:
             async with message.channel.typing():
-                live = await self.market.coin_markets(["bitcoin", "ethereum"])
+                requested = extract_gate_symbols(content)
+                live = await self.gate.coin_markets(requested or ["BTC", "ETH"])
                 answer = await self.chat.reply(
                     message.channel.id, message.author.display_name, content, live
                 )
             await message.reply(answer[:2000], mention_author=False)
         except AIUnavailable as exc:
             await message.reply(str(exc), mention_author=False)
+        except MarketError as exc:
+            await message.reply(f"⚠️ {exc}", mention_author=False)
         except Exception:
             logger.exception("AI 聊天失败")
             await message.reply("AI 服务暂时不可用，请稍后再试。", mention_author=False)
@@ -168,21 +174,15 @@ class CryptoBot(discord.Client):
                 ephemeral=True,
             )
 
-        @self.tree.command(name="price", description="查询加密货币实时价格")
-        @app_commands.describe(coin="币种，例如 BTC、ETH、SOL", currency="计价货币：usd/cny/eur")
+        @self.tree.command(name="price", description="查询 Gate 现货 USDT 实时价格")
+        @app_commands.describe(coin="Gate 币种，例如 BTC、BLESS、KORU")
         async def price_command(
-            interaction: discord.Interaction, coin: str, currency: str = "usd"
+            interaction: discord.Interaction, coin: str
         ) -> None:
             await interaction.response.defer()
             try:
-                currency = currency.lower()
-                if currency not in {"usd", "cny", "eur"}:
-                    raise MarketError("计价货币仅支持 usd、cny、eur。")
-                resolved = await self.market.resolve_coin(coin)
-                item = (await self.market.coin_markets([resolved.id], currency)).get(resolved.id)
-                if not item:
-                    raise MarketError("暂时没有该币种的市场数据。")
-                embed = self._coin_embed(item, currency)
+                item = await self.gate.ticker(coin)
+                embed = self._coin_embed(item, "usdt")
                 await interaction.followup.send(embed=embed)
             except MarketError as exc:
                 await interaction.followup.send(f"⚠️ {exc}", ephemeral=True)
@@ -226,7 +226,8 @@ class CryptoBot(discord.Client):
             try:
                 if days not in {1, 7, 30}:
                     raise MarketError("天数只能选择 1、7 或 30。")
-                resolved = await self.market.resolve_coin(coin)
+                resolved = self.gate.resolve_symbol(coin)
+                await self.gate.ticker(resolved.symbol)
                 points = await self.market.chart(resolved.id, days)
                 image = await asyncio.to_thread(render_price_chart, points, resolved.symbol, days)
                 await interaction.followup.send(
@@ -363,19 +364,13 @@ class CryptoBot(discord.Client):
             description=f"## {money(item.get('current_price'), currency)}",
             color=color,
         )
-        embed.add_field(
-            name="1h", value=percent(item.get("price_change_percentage_1h_in_currency"))
-        )
         embed.add_field(name="24h", value=percent(change))
-        embed.add_field(
-            name="7d", value=percent(item.get("price_change_percentage_7d_in_currency"))
-        )
         embed.add_field(name="24h 高", value=money(item.get("high_24h"), currency))
         embed.add_field(name="24h 低", value=money(item.get("low_24h"), currency))
         embed.add_field(name="成交量", value=compact(item.get("total_volume"), currency))
         if item.get("image"):
             embed.set_thumbnail(url=str(item["image"]))
-        embed.set_footer(text="数据来源：CoinGecko · 不构成投资建议")
+        embed.set_footer(text="数据来源：Gate 现货（USDT）· 不构成投资建议")
         return embed
 
     def _market_update_embed(
@@ -394,7 +389,9 @@ class CryptoBot(discord.Client):
                 ),
                 inline=True,
             )
-        embed.set_footer(text=f"更新：{local_time:%Y-%m-%d %H:%M} · CoinGecko · 不构成投资建议")
+        embed.set_footer(
+            text=f"更新：{local_time:%Y-%m-%d %H:%M} · Gate 现货 USDT · 不构成投资建议"
+        )
         return embed
 
     @tasks.loop(seconds=60)
@@ -433,7 +430,7 @@ class CryptoBot(discord.Client):
         channel = self.get_channel(config.market_channel_id or 0)
         if not isinstance(channel, discord.TextChannel):
             return
-        data = await self.market.coin_markets(["bitcoin", "ethereum"])
+        data = await self.gate.coin_markets(["bitcoin", "ethereum"])
         if len(data) != 2:
             raise MarketError("BTC/ETH 行情数据不完整。")
         embed = self._market_update_embed(data, config.timezone)
@@ -456,7 +453,7 @@ class CryptoBot(discord.Client):
         channel = self.get_channel(config.daily_channel_id or 0)
         if not isinstance(channel, discord.TextChannel):
             return
-        data = await self.market.coin_markets(["bitcoin", "ethereum"])
+        data = await self.gate.coin_markets(["bitcoin", "ethereum"])
         prices = {coin_id: float(item["current_price"]) for coin_id, item in data.items()}
         previous = await self.db.previous_snapshot(config.guild_id, today)
         embed = discord.Embed(title="📅 每日行情对比", color=0x5865F2)
@@ -470,7 +467,7 @@ class CryptoBot(discord.Client):
                 value = f"今日：**{money(current)}**\n首次记录，明日起生成对比"
             embed.add_field(name=symbol, value=value, inline=True)
         comparison_date = previous[0] if previous else "无历史快照"
-        embed.set_footer(text=f"对比基准：{comparison_date} · CoinGecko · 不构成投资建议")
+        embed.set_footer(text=f"对比基准：{comparison_date} · Gate 现货 USDT · 不构成投资建议")
         await channel.send(embed=embed)
         await self.db.save_snapshot(config.guild_id, today, prices)
         await self.db.update_guild(config.guild_id, last_daily_date=today)
@@ -481,7 +478,7 @@ class CryptoBot(discord.Client):
             return
         coin_ids = list({item.coin_id for item in alerts})
         try:
-            data = await self.market.coin_markets(coin_ids)
+            data = await self.gate.coin_markets(coin_ids)
         except MarketError:
             logger.warning("价格提醒行情查询失败", exc_info=True)
             return
@@ -501,7 +498,7 @@ class CryptoBot(discord.Client):
                 await channel.send(
                     f"🚨 <@{alert.user_id}> **{alert.coin_symbol} 价格提醒**\n"
                     f"{label} {money(alert.target)}，当前价格 **{money(current)}**\n"
-                    "数据来源：CoinGecko · 不构成投资建议",
+                    "数据来源：Gate 现货 USDT · 不构成投资建议",
                     allowed_mentions=discord.AllowedMentions(users=True),
                 )
             await self.db.deactivate_alert(alert.id, alert.guild_id)
