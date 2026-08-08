@@ -1,0 +1,43 @@
+[project]
+name = "ethupbot"
+version = "0.1.0"
+description = "Discord crypto market updates, alerts, charts and Sub2API chat"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "aiohttp>=3.10,<4",
+  "aiosqlite>=0.20,<1",
+  "discord.py>=2.4,<3",
+  "matplotlib>=3.9,<4",
+  "openai>=1.60,<3",
+  "python-dotenv>=1.0,<2",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0,<9",
+  "pytest-asyncio>=0.24,<2",
+  "ruff>=0.9,<1",
+]
+
+[project.scripts]
+crypto-discord-bot = "crypto_bot.main:main"
+
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+pythonpath = ["src"]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
