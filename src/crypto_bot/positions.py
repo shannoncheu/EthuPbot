@@ -31,9 +31,7 @@ def parse_position_message(message: str) -> ParsedPosition | None:
         return None
 
     leverage_match = re.search(r"(\d+(?:\.\d+)?)\s*(?:倍|x)", text, re.IGNORECASE)
-    direction = (
-        "short" if re.search(r"(?:做|开)?空|short", text, re.IGNORECASE) else "long"
-    )
+    direction = "short" if re.search(r"做?空|short", text, re.IGNORECASE) else "long"
     return ParsedPosition(
         symbol=quantity_match.group(2).upper(),
         entry_price=float(entry_match.group(1)),

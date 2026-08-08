@@ -506,20 +506,7 @@ class CryptoBot(discord.Client):
             await message.reply(embed=embed, mention_author=False)
             return True
 
-        position_words = (
-            "买",
-            "开仓",
-            "开多",
-            "开空",
-            "做多",
-            "做空",
-            "入场",
-            "成本",
-            "杠杆",
-            "long",
-            "short",
-        )
-        if any(word in content.lower() for word in position_words):
+        if any(word in content.lower() for word in ("买", "开仓", "入场", "成本", "long", "short")):
             parsed = parse_position_message(content)
             if parsed is None:
                 await message.reply(
