@@ -42,7 +42,7 @@ async def test_sub2api_chat_completions_mode(tmp_path: Path) -> None:
 
     assert answer == "简洁但完整的测试回复"
     assert completions.request["model"] == "test-model"
-    assert completions.request["max_tokens"] == 500
+    assert completions.request["max_completion_tokens"] == 500
     messages = completions.request["messages"]
     assert messages[0]["role"] == "system"
     assert "不得为了简短而省略" in messages[0]["content"]

@@ -70,7 +70,7 @@ class ChatService:
             response = await self.client.chat.completions.create(
                 model=self.model,
                 messages=[{"role": "system", "content": instructions}, *inputs],
-                max_tokens=500,
+                max_completion_tokens=500,
             )
             answer = (response.choices[0].message.content or "").strip()
 
