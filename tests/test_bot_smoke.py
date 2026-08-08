@@ -32,5 +32,9 @@ async def test_bot_registers_expected_commands(tmp_path: Path) -> None:
         "alert_delete",
         "chat_clear",
         "bot_status",
+        "position_channel",
+        "position_add",
+        "positions",
+        "position_delete",
     } <= names
     await bot.close()

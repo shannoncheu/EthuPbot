@@ -14,6 +14,7 @@ from .charts import render_price_chart
 from .config import Settings
 from .database import Database, GuildConfig
 from .market import CoinGeckoClient, EtherscanClient, GateClient, MarketError, extract_gate_symbols
+from .positions import ParsedPosition, calculate_pnl, parse_position_message
 
 logger = logging.getLogger(__name__)
 
@@ -91,6 +92,10 @@ class CryptoBot(discord.Client):
         if message.author.bot or not message.guild or not message.content.strip():
             return
         config = await self.db.get_guild(message.guild.id)
+        if message.channel.id == config.position_channel_id and await self._handle_position_message(
+            message
+        ):
+            return
         if message.channel.id != config.chat_channel_id:
             return
 
@@ -174,11 +179,9 @@ class CryptoBot(discord.Client):
                 ephemeral=True,
             )
 
-        @self.tree.command(name="price", description="查询 Gate 现货 USDT 实时价格")
+        @self.tree.command(name="price", description="查询 Gate 现货或 USDT 永续合约价格")
         @app_commands.describe(coin="Gate 币种，例如 BTC、BLESS、KORU")
-        async def price_command(
-            interaction: discord.Interaction, coin: str
-        ) -> None:
+        async def price_command(interaction: discord.Interaction, coin: str) -> None:
             await interaction.response.defer()
             try:
                 item = await self.gate.ticker(coin)
@@ -186,6 +189,101 @@ class CryptoBot(discord.Client):
                 await interaction.followup.send(embed=embed)
             except MarketError as exc:
                 await interaction.followup.send(f"⚠️ {exc}", ephemeral=True)
+
+        @self.tree.command(name="position_channel", description="设置持仓收益查询频道（管理员）")
+        @app_commands.default_permissions(manage_guild=True)
+        async def position_channel_command(
+            interaction: discord.Interaction, channel: discord.TextChannel
+        ) -> None:
+            if not interaction.guild_id:
+                await interaction.response.send_message(
+                    "该指令只能在服务器中使用。", ephemeral=True
+                )
+                return
+            await self.db.update_guild(interaction.guild_id, position_channel_id=channel.id)
+            await interaction.response.send_message(
+                f"✅ 持仓收益频道已设置为 {channel.mention}", ephemeral=True
+            )
+
+        @self.tree.command(name="position_add", description="记录一笔持仓")
+        @app_commands.describe(
+            coin="Gate 币种，例如 BTC、KORU",
+            entry_price="开仓均价",
+            quantity="标的实际数量，例如 0.1 BTC",
+            leverage="杠杆倍数，1-125",
+            direction="多单或空单",
+            market="现货或 USDT 永续；自动会按杠杆和方向选择",
+        )
+        @app_commands.choices(
+            direction=[
+                app_commands.Choice(name="多单", value="long"),
+                app_commands.Choice(name="空单", value="short"),
+            ],
+            market=[
+                app_commands.Choice(name="USDT 永续合约", value="futures"),
+                app_commands.Choice(name="现货", value="spot"),
+            ],
+        )
+        async def position_add_command(
+            interaction: discord.Interaction,
+            coin: str,
+            entry_price: app_commands.Range[float, 0.0000000001],
+            quantity: app_commands.Range[float, 0.0000000001],
+            direction: app_commands.Choice[str],
+            leverage: app_commands.Range[float, 1, 125] = 1,
+            market: app_commands.Choice[str] | None = None,
+        ) -> None:
+            if not interaction.guild_id:
+                await interaction.response.send_message(
+                    "该指令只能在服务器中使用。", ephemeral=True
+                )
+                return
+            await interaction.response.defer(ephemeral=True)
+            preferred = (
+                market.value
+                if market
+                else ("futures" if leverage > 1 or direction.value == "short" else "auto")
+            )
+            try:
+                parsed = ParsedPosition(
+                    coin.upper(), entry_price, quantity, leverage, direction.value
+                )
+                position_id, item = await self._save_position(
+                    interaction.guild_id, interaction.user.id, parsed, preferred
+                )
+                await interaction.followup.send(
+                    self._position_confirmation(position_id, parsed, item), ephemeral=True
+                )
+            except MarketError as exc:
+                await interaction.followup.send(f"⚠️ {exc}", ephemeral=True)
+
+        @self.tree.command(name="positions", description="查询自己的实时持仓收益")
+        async def positions_command(interaction: discord.Interaction) -> None:
+            if not interaction.guild_id:
+                await interaction.response.send_message(
+                    "该指令只能在服务器中使用。", ephemeral=True
+                )
+                return
+            await interaction.response.defer(ephemeral=True)
+            embed = await self._position_report(interaction.guild_id, interaction.user.id)
+            await interaction.followup.send(embed=embed, ephemeral=True)
+
+        @self.tree.command(name="position_delete", description="删除自己记录的一笔持仓")
+        async def position_delete_command(
+            interaction: discord.Interaction, position_id: int
+        ) -> None:
+            if not interaction.guild_id:
+                await interaction.response.send_message(
+                    "该指令只能在服务器中使用。", ephemeral=True
+                )
+                return
+            deleted = await self.db.delete_position(
+                position_id, interaction.guild_id, interaction.user.id
+            )
+            await interaction.response.send_message(
+                "✅ 持仓记录已删除。" if deleted else "没有找到属于你的这笔持仓。",
+                ephemeral=True,
+            )
 
         @self.tree.command(name="market", description="查看加密货币整体市场概况")
         async def market_command(interaction: discord.Interaction) -> None:
@@ -226,8 +324,7 @@ class CryptoBot(discord.Client):
             try:
                 if days not in {1, 7, 30}:
                     raise MarketError("天数只能选择 1、7 或 30。")
-                resolved = self.gate.resolve_symbol(coin)
-                await self.gate.ticker(resolved.symbol)
+                resolved = await self.market.resolve_coin(coin)
                 points = await self.market.chart(resolved.id, days)
                 image = await asyncio.to_thread(render_price_chart, points, resolved.symbol, days)
                 await interaction.followup.send(
@@ -276,7 +373,8 @@ class CryptoBot(discord.Client):
                 return
             await interaction.response.defer(ephemeral=True)
             try:
-                resolved = await self.market.resolve_coin(coin)
+                resolved = self.gate.resolve_symbol(coin)
+                await self.gate.ticker(resolved.symbol)
                 alert_id = await self.db.add_alert(
                     interaction.guild_id,
                     interaction.channel_id,
@@ -345,6 +443,7 @@ class CryptoBot(discord.Client):
                 f"行情频道：{self._channel_text(config.market_channel_id)}\n"
                 f"日报频道：{self._channel_text(config.daily_channel_id)}\n"
                 f"聊天频道：{self._channel_text(config.chat_channel_id)}\n"
+                f"持仓频道：{self._channel_text(config.position_channel_id)}\n"
                 f"行情间隔：{config.update_minutes} 分钟\n"
                 f"日报时间：{config.daily_hour:02d}:00（{config.timezone}）\n"
                 f"AI：{'已配置' if self.settings.ai_api_key else '未配置'}"
@@ -356,21 +455,132 @@ class CryptoBot(discord.Client):
     def _channel_text(self, channel_id: int | None) -> str:
         return f"<#{channel_id}>" if channel_id else "未设置"
 
+    async def _save_position(
+        self,
+        guild_id: int,
+        user_id: int,
+        parsed: ParsedPosition,
+        market_type: str,
+    ) -> tuple[int, dict[str, object]]:
+        if not (parsed.entry_price > 0 and parsed.quantity > 0 and 1 <= parsed.leverage <= 125):
+            raise MarketError("开仓价和数量必须大于 0，杠杆必须为 1-125 倍。")
+        item = await self.gate.ticker(parsed.symbol, market_type)
+        position_id = await self.db.add_position(
+            guild_id,
+            user_id,
+            str(item["symbol"]),
+            str(item["market_type"]),
+            parsed.entry_price,
+            parsed.quantity,
+            parsed.leverage,
+            parsed.direction,
+        )
+        return position_id, item
+
+    def _position_confirmation(
+        self, position_id: int, parsed: ParsedPosition, item: dict[str, object]
+    ) -> str:
+        side = "多单" if parsed.direction == "long" else "空单"
+        market = "USDT 永续" if item["market_type"] == "futures" else "现货"
+        return (
+            f"✅ 已记录持仓 `#{position_id}`：{parsed.symbol} {side} · {market}\n"
+            f"入场 {parsed.entry_price:g} · 数量 {parsed.quantity:g} · {parsed.leverage:g}x\n"
+            "发送“收益多少”即可按 Gate 最新行情计算。"
+        )
+
+    async def _handle_position_message(self, message: discord.Message) -> bool:
+        assert message.guild is not None
+        content = message.content.strip()
+        if any(word in content for word in ("收益", "盈亏", "持仓")):
+            async with message.channel.typing():
+                embed = await self._position_report(message.guild.id, message.author.id)
+            await message.reply(embed=embed, mention_author=False)
+            return True
+
+        if any(word in content.lower() for word in ("买", "开仓", "入场", "成本", "long", "short")):
+            parsed = parse_position_message(content)
+            if parsed is None:
+                await message.reply(
+                    "我没能完整识别。请按示例发送：`我在 64000 买了 0.1 个 BTC，10 倍多单`，"
+                    "或使用 `/position_add`。",
+                    mention_author=False,
+                )
+                return True
+            preferred = "futures" if parsed.leverage > 1 or parsed.direction == "short" else "auto"
+            try:
+                position_id, item = await self._save_position(
+                    message.guild.id, message.author.id, parsed, preferred
+                )
+                await message.reply(
+                    self._position_confirmation(position_id, parsed, item), mention_author=False
+                )
+            except MarketError as exc:
+                await message.reply(f"⚠️ {exc}", mention_author=False)
+            return True
+        return False
+
+    async def _position_report(self, guild_id: int, user_id: int) -> discord.Embed:
+        positions = await self.db.user_positions(guild_id, user_id)
+        embed = discord.Embed(title="📈 实时持仓收益", color=0x5865F2)
+        if not positions:
+            embed.description = "你还没有记录持仓。使用 `/position_add` 或直接发送开仓信息。"
+            return embed
+        for position in positions[:20]:
+            try:
+                item = await self.gate.ticker(position.symbol, position.asset_type)
+                current = float(item["current_price"])
+                pnl, margin, roi = calculate_pnl(
+                    position.entry_price,
+                    current,
+                    position.quantity,
+                    position.leverage,
+                    position.direction,
+                )
+                side = "多" if position.direction == "long" else "空"
+                market = "永续" if position.asset_type == "futures" else "现货"
+                quote = str(item.get("quote_currency", "USDT"))
+                value = (
+                    f"{market} · {side} · {position.leverage:g}x · 数量 {position.quantity:g}\n"
+                    f"入场 `{position.entry_price:g}` → 现价 `{current:g}` {quote}\n"
+                    f"未实现盈亏 **{pnl:+,.4f} {quote}** · 保证金 `{margin:,.4f}`\n"
+                    f"保证金收益率 **{roi:+.2f}%**"
+                )
+            except MarketError as exc:
+                value = f"暂时无法取得行情：{exc}"
+            embed.add_field(name=f"#{position.id} · {position.symbol}", value=value, inline=False)
+        embed.set_footer(text="Gate 标记价/现货价 · 未计手续费、资金费与滑点 · 不构成投资建议")
+        return embed
+
     def _coin_embed(self, item: dict[str, object], currency: str = "usd") -> discord.Embed:
         change = item.get("price_change_percentage_24h")
-        color = 0x16C784 if isinstance(change, (int, float)) and change >= 0 else 0xEA3943
+        color = 0x5865F2
+        if isinstance(change, (int, float)):
+            color = 0x16C784 if change >= 0 else 0xEA3943
+        is_futures = item.get("market_type") == "futures"
         embed = discord.Embed(
-            title=f"{item['name']} ({str(item['symbol']).upper()})",
+            title=(
+                f"{item['name']} ({str(item['symbol']).upper()}) · "
+                f"{'USDT 永续合约' if is_futures else '现货'}"
+            ),
             description=f"## {money(item.get('current_price'), currency)}",
             color=color,
         )
+        if is_futures:
+            embed.add_field(name="最新成交价", value=money(item.get("last_price"), currency))
+            embed.add_field(name="指数价格", value=money(item.get("index_price"), currency))
+            funding = item.get("funding_rate")
+            embed.add_field(
+                name="资金费率",
+                value=f"{float(funding) * 100:+.4f}%" if funding is not None else "—",
+            )
         embed.add_field(name="24h", value=percent(change))
         embed.add_field(name="24h 高", value=money(item.get("high_24h"), currency))
         embed.add_field(name="24h 低", value=money(item.get("low_24h"), currency))
         embed.add_field(name="成交量", value=compact(item.get("total_volume"), currency))
         if item.get("image"):
             embed.set_thumbnail(url=str(item["image"]))
-        embed.set_footer(text="数据来源：Gate 现货（USDT）· 不构成投资建议")
+        source = "Gate USDT 永续 · 主价格为标记价" if is_futures else "Gate 现货 USDT"
+        embed.set_footer(text=f"数据来源：{source} · 不构成投资建议")
         return embed
 
     def _market_update_embed(

@@ -7,12 +7,14 @@
 - 行情频道：定时编辑同一条 BTC/ETH 消息，避免刷屏。
 - 日报频道：按服务器时区生成固定时刻价格对比。
 - AI 频道：只在指定频道自动回复；保留最多 10 轮本地短期上下文。
-- `/price`：Gate 现货 USDT 成交价、24h 涨跌、高低点和成交量。
+- `/price`：优先查询 Gate 现货；没有现货时自动查询 USDT 永续合约（例如 KORU）。
 - `/market`：总市值、成交量、市场涨跌和 BTC/ETH 市占率。
 - `/chart`：1、7、30 日 PNG 走势图。
 - `/gas`：Ethereum 主网低速、标准和快速 Gas。
 - `/alert`、`/alerts`、`/alert_delete`：一次性美元价格提醒。
 - `/setup`：管理员配置频道、频率、日报时间和时区。
+- 持仓频道：记录多单/空单、数量、入场价和杠杆，按 Gate 标记价查询实时盈亏。
+- `/position_channel`、`/position_add`、`/positions`、`/position_delete`：管理持仓收益。
 - `/bot_status`、`/chat_clear`：查看状态与清理 AI 上下文。
 - SQLite 持久化；密钥仅从环境变量读取。
 
@@ -86,17 +88,32 @@ docker compose logs -f bot
 /alerts
 /alert_delete alert_id:3
 /bot_status
+/position_channel channel:#持仓收益
+/position_add coin:KORU entry_price:0.02 quantity:1000 direction:多单 leverage:10 market:USDT永续合约
+/positions
+/position_delete position_id:1
+```
+
+设置持仓频道后，也可以直接发送：
+
+```text
+我在 64000 买了 0.1 个 BTC，10 倍多单
+收益多少
 ```
 
 ## 数据与行为说明
 
-- 实时价格、日报和提醒：Gate 现货 USDT 公开 API（无需 Gate API Key）。
+- 实时价格：Gate 现货与 USDT 永续合约公开 API（无需 Gate API Key）。
+- BTC/ETH 日报和默认提醒：Gate 现货 USDT。
 - 整体市场与走势图：CoinGecko Demo API。
 - Gas 数据：Etherscan API V2。
 - AI：Sub2API，支持 OpenAI 兼容的 Chat Completions 和 Responses 两种模式。
 - Discord 短期聊天上下文保存在本地 SQLite，每个频道最多保留 20 条消息。
 - 行情播报会编辑原消息；若原消息被删除，Bot 会创建新消息。
 - 价格提醒触发一次后自动停用，避免价格反复穿越目标造成刷屏。
+- 合约持仓使用标记价计算；实际数量已确定时，杠杆只影响保证金和收益率，不会再次放大盈亏。
+- 持仓收益不包含手续费、资金费和滑点；不同用户的持仓记录相互隔离。
+- `/positions` 是仅本人可见的临时回复；在持仓频道直接询问时，回复会被频道成员看到。
 - Bot 不保存钱包、助记词或私钥，不执行交易，所有内容均不构成投资建议。
 
 ## 测试

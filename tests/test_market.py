@@ -23,20 +23,50 @@ async def test_gate_ticker_is_normalized(monkeypatch: pytest.MonkeyPatch) -> Non
     client = GateClient()
 
     async def fake_get(*args: object, **kwargs: object) -> list[dict[str, str]]:
-        return [{
-            "currency_pair": "BLESS_USDT",
-            "last": "0.031",
-            "change_percentage": "2.5",
-            "high_24h": "0.034",
-            "low_24h": "0.029",
-            "quote_volume": "123456",
-        }]
+        return [
+            {
+                "currency_pair": "BLESS_USDT",
+                "last": "0.031",
+                "change_percentage": "2.5",
+                "high_24h": "0.034",
+                "low_24h": "0.029",
+                "quote_volume": "123456",
+            }
+        ]
 
     monkeypatch.setattr(client, "_get", fake_get)
     item = await client.ticker("bless")
     assert item["currency_pair"] == "BLESS_USDT"
     assert item["current_price"] == 0.031
     assert item["price_change_percentage_24h"] == 2.5
+
+
+@pytest.mark.asyncio
+async def test_gate_falls_back_to_usdt_futures(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = GateClient()
+
+    async def fake_get(path: str, *args: object, **kwargs: object) -> list[dict[str, str]]:
+        if path == "/spot/tickers":
+            raise MarketError("Gate 返回 HTTP 400")
+        return [
+            {
+                "contract": "KORU_USDT",
+                "last": "0.0201",
+                "mark_price": "0.0200",
+                "index_price": "0.0199",
+                "change_percentage": "3.2",
+                "funding_rate": "0.0001",
+                "high_24h": "0.022",
+                "low_24h": "0.018",
+                "volume_24h_quote": "100000",
+            }
+        ]
+
+    monkeypatch.setattr(client, "_get", fake_get)
+    item = await client.ticker("KORU")
+    assert item["market_type"] == "futures"
+    assert item["current_price"] == 0.0200
+    assert item["last_price"] == 0.0201
 
 
 def test_extract_gate_symbols_from_chinese_question() -> None:

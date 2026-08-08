@@ -42,8 +42,10 @@ class ChatService:
         prices = []
         for item in market_context.values():
             quote = item.get("quote_currency", "USD")
+            market = "永续合约标记价" if item.get("market_type") == "futures" else "现货价"
             prices.append(
-                f"{item.get('symbol', '').upper()}: {item.get('current_price', 0):,.8g} {quote}, "
+                f"{item.get('symbol', '').upper()} {market}: "
+                f"{item.get('current_price', 0):,.8g} {quote}, "
                 f"24h {item.get('price_change_percentage_24h', 0):+.2f}%"
             )
 
@@ -54,7 +56,7 @@ class ChatService:
             "行情问题只能使用下面提供的实时数据；没有数据时明确说不知道，不得编造价格、"
             "新闻、监管事件或收益保证。区分事实、推测和个人观点。涉及投资决策时提醒用户"
             "自行研究，且不构成投资建议。不要索要助记词、私钥或交易所密码。\n"
-            f"当前现货行情数据（来自 Gate）：{'; '.join(prices)}"
+            f"当前行情数据（来自 Gate 现货或 USDT 永续合约）：{'; '.join(prices)}"
         )
         inputs = [*history, {"role": "user", "content": f"{user_name}: {message}"}]
 

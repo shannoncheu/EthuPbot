@@ -13,6 +13,7 @@ class GuildConfig:
     market_channel_id: int | None = None
     chat_channel_id: int | None = None
     daily_channel_id: int | None = None
+    position_channel_id: int | None = None
     update_minutes: int = 10
     daily_hour: int = 8
     timezone: str = "Asia/Shanghai"
@@ -34,6 +35,19 @@ class PriceAlert:
     active: bool
 
 
+@dataclass(slots=True)
+class Position:
+    id: int
+    guild_id: int
+    user_id: int
+    symbol: str
+    asset_type: str
+    entry_price: float
+    quantity: float
+    leverage: float
+    direction: str
+
+
 class Database:
     def __init__(self, path: Path) -> None:
         self.path = path
@@ -51,6 +65,7 @@ class Database:
                     market_channel_id INTEGER,
                     chat_channel_id INTEGER,
                     daily_channel_id INTEGER,
+                    position_channel_id INTEGER,
                     update_minutes INTEGER NOT NULL DEFAULT 10,
                     daily_hour INTEGER NOT NULL DEFAULT 8,
                     timezone TEXT NOT NULL DEFAULT 'Asia/Shanghai',
@@ -89,10 +104,29 @@ class Database:
                     created_at TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS position (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    guild_id INTEGER NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    symbol TEXT NOT NULL,
+                    asset_type TEXT NOT NULL CHECK(asset_type IN ('spot', 'futures')),
+                    entry_price REAL NOT NULL CHECK(entry_price > 0),
+                    quantity REAL NOT NULL CHECK(quantity > 0),
+                    leverage REAL NOT NULL CHECK(leverage >= 1 AND leverage <= 125),
+                    direction TEXT NOT NULL CHECK(direction IN ('long', 'short')),
+                    created_at TEXT NOT NULL
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_alert_active ON price_alert(active);
                 CREATE INDEX IF NOT EXISTS idx_chat_channel ON chat_message(channel_id, id DESC);
+                CREATE INDEX IF NOT EXISTS idx_position_user
+                    ON position(guild_id, user_id, id);
                 """
             )
+            cursor = await db.execute("PRAGMA table_info(guild_config)")
+            columns = {row[1] for row in await cursor.fetchall()}
+            if "position_channel_id" not in columns:
+                await db.execute("ALTER TABLE guild_config ADD COLUMN position_channel_id INTEGER")
             await db.commit()
 
     def connect(self) -> aiosqlite.Connection:
@@ -124,6 +158,7 @@ class Database:
             "market_channel_id",
             "chat_channel_id",
             "daily_channel_id",
+            "position_channel_id",
             "update_minutes",
             "daily_hour",
             "timezone",
@@ -280,3 +315,57 @@ class Database:
         async with self.connect() as db:
             await db.execute("DELETE FROM chat_message WHERE channel_id = ?", (channel_id,))
             await db.commit()
+
+    async def add_position(
+        self,
+        guild_id: int,
+        user_id: int,
+        symbol: str,
+        asset_type: str,
+        entry_price: float,
+        quantity: float,
+        leverage: float,
+        direction: str,
+    ) -> int:
+        async with self.connect() as db:
+            cursor = await db.execute(
+                """INSERT INTO position
+                   (guild_id, user_id, symbol, asset_type, entry_price, quantity,
+                    leverage, direction, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    guild_id,
+                    user_id,
+                    symbol,
+                    asset_type,
+                    entry_price,
+                    quantity,
+                    leverage,
+                    direction,
+                    datetime.now(UTC).isoformat(),
+                ),
+            )
+            await db.commit()
+            return int(cursor.lastrowid)
+
+    async def user_positions(self, guild_id: int, user_id: int) -> list[Position]:
+        async with self.connect() as db:
+            db.row_factory = aiosqlite.Row
+            rows = await (
+                await db.execute(
+                    """SELECT id, guild_id, user_id, symbol, asset_type, entry_price,
+                              quantity, leverage, direction
+                       FROM position WHERE guild_id = ? AND user_id = ? ORDER BY id""",
+                    (guild_id, user_id),
+                )
+            ).fetchall()
+        return [Position(**dict(row)) for row in rows]
+
+    async def delete_position(self, position_id: int, guild_id: int, user_id: int) -> bool:
+        async with self.connect() as db:
+            cursor = await db.execute(
+                "DELETE FROM position WHERE id = ? AND guild_id = ? AND user_id = ?",
+                (position_id, guild_id, user_id),
+            )
+            await db.commit()
+            return cursor.rowcount > 0

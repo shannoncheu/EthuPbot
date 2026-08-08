@@ -43,7 +43,7 @@ GATE_SYMBOL_ALIASES = {
 
 
 class GateClient:
-    """Gate public spot-market client. No API key is required."""
+    """Gate public spot and USDT perpetual market client."""
 
     def __init__(self) -> None:
         self.base_url = "https://api.gateio.ws/api/v4"
@@ -85,30 +85,75 @@ class GateClient:
         name = COMMON_COINS.get(normalized, Coin(symbol, symbol, symbol)).name
         return Coin(symbol, symbol, name)
 
-    async def ticker(self, query: str) -> dict[str, Any]:
-        coin = self.resolve_symbol(query)
+    @staticmethod
+    def _number(item: dict[str, Any], key: str) -> float | None:
+        value = item.get(key)
+        return float(value) if value not in {None, ""} else None
+
+    async def _spot_ticker(self, coin: Coin) -> dict[str, Any]:
         pair = f"{coin.symbol}_USDT"
         data = await self._get("/spot/tickers", {"currency_pair": pair, "timezone": "utc0"})
         if not data:
             raise MarketError(f"Gate 现货没有找到 {pair} 交易对。")
         item = data[0]
-
-        def number(key: str) -> float | None:
-            value = item.get(key)
-            return float(value) if value not in {None, ""} else None
-
         return {
             "id": coin.id,
             "symbol": coin.symbol,
             "name": coin.name,
             "currency_pair": pair,
+            "market_type": "spot",
             "quote_currency": "USDT",
-            "current_price": number("last"),
-            "price_change_percentage_24h": number("change_percentage"),
-            "high_24h": number("high_24h"),
-            "low_24h": number("low_24h"),
-            "total_volume": number("quote_volume"),
+            "current_price": self._number(item, "last"),
+            "last_price": self._number(item, "last"),
+            "price_change_percentage_24h": self._number(item, "change_percentage"),
+            "high_24h": self._number(item, "high_24h"),
+            "low_24h": self._number(item, "low_24h"),
+            "total_volume": self._number(item, "quote_volume"),
         }
+
+    async def _futures_ticker(self, coin: Coin) -> dict[str, Any]:
+        contract = f"{coin.symbol}_USDT"
+        data = await self._get("/futures/usdt/tickers", {"contract": contract})
+        if not data:
+            raise MarketError(f"Gate 合约没有找到 {contract}。")
+        item = data[0]
+        mark_price = self._number(item, "mark_price")
+        last_price = self._number(item, "last")
+        return {
+            "id": coin.id,
+            "symbol": coin.symbol,
+            "name": coin.name,
+            "currency_pair": contract,
+            "market_type": "futures",
+            "quote_currency": "USDT",
+            "current_price": mark_price or last_price,
+            "mark_price": mark_price,
+            "last_price": last_price,
+            "index_price": self._number(item, "index_price"),
+            "funding_rate": self._number(item, "funding_rate"),
+            "price_change_percentage_24h": self._number(item, "change_percentage"),
+            "high_24h": self._number(item, "high_24h"),
+            "low_24h": self._number(item, "low_24h"),
+            "total_volume": self._number(item, "volume_24h_quote"),
+        }
+
+    async def ticker(self, query: str, market_type: str = "auto") -> dict[str, Any]:
+        coin = self.resolve_symbol(query)
+        if market_type == "spot":
+            return await self._spot_ticker(coin)
+        if market_type == "futures":
+            return await self._futures_ticker(coin)
+        if market_type != "auto":
+            raise ValueError("market_type must be auto, spot or futures")
+        try:
+            return await self._spot_ticker(coin)
+        except MarketError as spot_error:
+            if "HTTP 400" not in str(spot_error) and "没有找到" not in str(spot_error):
+                raise
+            try:
+                return await self._futures_ticker(coin)
+            except MarketError as exc:
+                raise MarketError(f"Gate 现货和 USDT 永续合约都没有找到 {coin.symbol}。") from exc
 
     async def coin_markets(self, coins: list[str]) -> dict[str, dict[str, Any]]:
         results: dict[str, dict[str, Any]] = {}

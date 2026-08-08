@@ -37,3 +37,17 @@ async def test_alert_lifecycle_and_chat_limit(tmp_path: Path) -> None:
     history = await db.chat_history(2, limit=30)
     assert len(history) == 20
     assert history[-1]["content"] == "message 24"
+
+
+@pytest.mark.asyncio
+async def test_position_lifecycle(tmp_path: Path) -> None:
+    db = Database(tmp_path / "test.db")
+    await db.initialize()
+    await db.update_guild(1, position_channel_id=99)
+    position_id = await db.add_position(1, 2, "BTC", "futures", 64_000, 0.1, 10, "long")
+    positions = await db.user_positions(1, 2)
+    assert positions[0].id == position_id
+    assert positions[0].leverage == 10
+    assert (await db.get_guild(1)).position_channel_id == 99
+    assert await db.delete_position(position_id, 1, 2)
+    assert await db.user_positions(1, 2) == []
