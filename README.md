@@ -1,13 +1,13 @@
 # EthuPbot
 
-一个按频道分工的 Discord Bot：使用 Gate 现货价格自动更新 BTC/ETH 行情、发送每日同一时刻对比、提供价格提醒和走势图，并在指定聊天频道中进行 AI 对话。
+一个按频道分工的 Discord Bot：使用 Gate USDT 永续合约价格自动更新 BTC/ETH 行情、发送每日同一时刻对比、提供价格提醒和走势图，并在指定聊天频道中进行 AI 对话。
 
 ## 已实现功能
 
 - 行情频道：定时编辑同一条 BTC/ETH 消息，避免刷屏。
 - 日报频道：按服务器时区生成固定时刻价格对比。
 - AI 频道：只在指定频道自动回复；保留最多 10 轮本地短期上下文。
-- `/price`：优先查询 Gate 现货；没有现货时自动查询 USDT 永续合约（例如 KORU）。
+- `/price`：查询 Gate USDT 永续合约（例如 BTC、ETH、KORU、BLESS）。
 - `/market`：总市值、成交量、市场涨跌和 BTC/ETH 市占率。
 - `/chart`：1、7、30 日 PNG 走势图。
 - `/gas`：Ethereum 主网低速、标准和快速 Gas。
@@ -103,8 +103,7 @@ docker compose logs -f bot
 
 ## 数据与行为说明
 
-- 实时价格：Gate 现货与 USDT 永续合约公开 API（无需 Gate API Key）。
-- BTC/ETH 日报和默认提醒：Gate 现货 USDT。
+- 实时价格、BTC/ETH 日报和默认提醒：Gate USDT 永续合约公开 API（无需 Gate API Key）。
 - 整体市场与走势图：CoinGecko Demo API。
 - Gas 数据：Etherscan API V2。
 - AI：Sub2API，支持 OpenAI 兼容的 Chat Completions 和 Responses 两种模式。

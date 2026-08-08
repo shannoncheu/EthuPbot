@@ -35,14 +35,14 @@ async def test_gate_ticker_is_normalized(monkeypatch: pytest.MonkeyPatch) -> Non
         ]
 
     monkeypatch.setattr(client, "_get", fake_get)
-    item = await client.ticker("bless")
+    item = await client.ticker("bless", "spot")
     assert item["currency_pair"] == "BLESS_USDT"
     assert item["current_price"] == 0.031
     assert item["price_change_percentage_24h"] == 2.5
 
 
 @pytest.mark.asyncio
-async def test_gate_falls_back_to_usdt_futures(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_gate_uses_usdt_futures_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
     client = GateClient()
 
     async def fake_get(path: str, *args: object, **kwargs: object) -> list[dict[str, str]]:
@@ -72,3 +72,4 @@ async def test_gate_falls_back_to_usdt_futures(monkeypatch: pytest.MonkeyPatch) 
 def test_extract_gate_symbols_from_chinese_question() -> None:
     assert extract_gate_symbols("bless现在的价格是多少") == ["BLESS"]
     assert extract_gate_symbols("那KORU的行情呢") == ["KORU"]
+    assert extract_gate_symbols("KORU和BLESS的价格分别是多少") == ["KORU", "BLESS"]

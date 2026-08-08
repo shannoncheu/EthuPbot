@@ -137,7 +137,7 @@ class GateClient:
             "total_volume": self._number(item, "volume_24h_quote"),
         }
 
-    async def ticker(self, query: str, market_type: str = "auto") -> dict[str, Any]:
+    async def ticker(self, query: str, market_type: str = "futures") -> dict[str, Any]:
         coin = self.resolve_symbol(query)
         if market_type == "spot":
             return await self._spot_ticker(coin)
@@ -168,6 +168,28 @@ class GateClient:
 
 def extract_gate_symbols(message: str) -> list[str]:
     """Extract explicit symbols from natural-language price questions."""
+    price_words = ("价格", "行情", "多少钱", "price", "prices")
+    if any(word in message.lower() for word in price_words):
+        ignored = {
+            "AND",
+            "OR",
+            "PRICE",
+            "PRICES",
+            "WHAT",
+            "IS",
+            "ARE",
+            "THE",
+            "NOW",
+            "PLEASE",
+            "GATE",
+            "USDT",
+        }
+        symbols = re.findall(
+            r"(?i)(?<![a-z0-9])([a-z][a-z0-9]{1,29})(?![a-z0-9])", message
+        )
+        return list(
+            dict.fromkeys(symbol.upper() for symbol in symbols if symbol.upper() not in ignored)
+        )[:5]
     matches = re.findall(
         r"(?i)(?<![a-z0-9])([a-z][a-z0-9]{1,29})"
         r"(?=(?:(?:现在|目前)?的?)?(?:价格|行情|多少钱))",

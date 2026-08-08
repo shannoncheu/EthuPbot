@@ -188,7 +188,7 @@ class CryptoBot(discord.Client):
                 ephemeral=True,
             )
 
-        @self.tree.command(name="price", description="查询 Gate 现货或 USDT 永续合约价格")
+        @self.tree.command(name="price", description="查询 Gate USDT 永续合约价格")
         @app_commands.describe(coin="Gate 币种，例如 BTC、BLESS、KORU")
         async def price_command(interaction: discord.Interaction, coin: str) -> None:
             await interaction.response.defer()
@@ -221,7 +221,7 @@ class CryptoBot(discord.Client):
             quantity="标的实际数量，例如 0.1 BTC",
             leverage="杠杆倍数，1-125",
             direction="多单或空单",
-            market="现货或 USDT 永续；自动会按杠杆和方向选择",
+            market="默认 USDT 永续；仅在需要时手动选择现货",
         )
         @app_commands.choices(
             direction=[
@@ -248,11 +248,7 @@ class CryptoBot(discord.Client):
                 )
                 return
             await interaction.response.defer(ephemeral=True)
-            preferred = (
-                market.value
-                if market
-                else ("futures" if leverage > 1 or direction.value == "short" else "auto")
-            )
+            preferred = market.value if market else "futures"
             try:
                 parsed = ParsedPosition(
                     coin.upper(), entry_price, quantity, leverage, direction.value
@@ -515,7 +511,7 @@ class CryptoBot(discord.Client):
                     mention_author=False,
                 )
                 return True
-            preferred = "futures" if parsed.leverage > 1 or parsed.direction == "short" else "auto"
+            preferred = "futures"
             try:
                 position_id, item = await self._save_position(
                     message.guild.id, message.author.id, parsed, preferred
@@ -609,7 +605,7 @@ class CryptoBot(discord.Client):
                 inline=True,
             )
         embed.set_footer(
-            text=f"更新：{local_time:%Y-%m-%d %H:%M} · Gate 现货 USDT · 不构成投资建议"
+            text=f"更新：{local_time:%Y-%m-%d %H:%M} · Gate USDT 永续 · 不构成投资建议"
         )
         return embed
 
@@ -686,7 +682,7 @@ class CryptoBot(discord.Client):
                 value = f"今日：**{money(current)}**\n首次记录，明日起生成对比"
             embed.add_field(name=symbol, value=value, inline=True)
         comparison_date = previous[0] if previous else "无历史快照"
-        embed.set_footer(text=f"对比基准：{comparison_date} · Gate 现货 USDT · 不构成投资建议")
+        embed.set_footer(text=f"对比基准：{comparison_date} · Gate USDT 永续 · 不构成投资建议")
         await channel.send(embed=embed)
         await self.db.save_snapshot(config.guild_id, today, prices)
         await self.db.update_guild(config.guild_id, last_daily_date=today)
@@ -717,7 +713,7 @@ class CryptoBot(discord.Client):
                 await channel.send(
                     f"🚨 <@{alert.user_id}> **{alert.coin_symbol} 价格提醒**\n"
                     f"{label} {money(alert.target)}，当前价格 **{money(current)}**\n"
-                    "数据来源：Gate 现货 USDT · 不构成投资建议",
+                    "数据来源：Gate USDT 永续 · 不构成投资建议",
                     allowed_mentions=discord.AllowedMentions(users=True),
                 )
             await self.db.deactivate_alert(alert.id, alert.guild_id)
