@@ -62,7 +62,7 @@ python -m crypto_bot.main
 首次启动后，在 Discord 服务器中执行：
 
 ```text
-/setup market_channel:#行情更新 chat_channel:#聊天频道 daily_channel:#每日行情 update_minutes:10 daily_hour:8 timezone:Asia/Shanghai
+/setup market_channel:#行情更新 chat_channel:#聊天频道 position_channel:#持仓收益 daily_channel:#每日行情 update_minutes:10 daily_hour:8 timezone:Asia/Shanghai
 ```
 
 Bot 会立即开始定时检查。第一份日报只建立基准快照；从第二天开始显示同一播报时刻的日涨跌。

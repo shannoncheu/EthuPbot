@@ -133,6 +133,7 @@ class CryptoBot(discord.Client):
         @app_commands.describe(
             market_channel="自动更新行情的频道",
             chat_channel="AI 自动回复的聊天频道",
+            position_channel="持仓收益查询频道",
             daily_channel="每日对比报告频道（留空则使用行情频道）",
             update_minutes="行情更新间隔，5-60 分钟",
             daily_hour="日报小时，按所选时区计算，0-23",
@@ -143,6 +144,7 @@ class CryptoBot(discord.Client):
             interaction: discord.Interaction,
             market_channel: discord.TextChannel,
             chat_channel: discord.TextChannel,
+            position_channel: discord.TextChannel | None = None,
             daily_channel: discord.TextChannel | None = None,
             update_minutes: app_commands.Range[int, 5, 60] = 10,
             daily_hour: app_commands.Range[int, 0, 23] = 8,
@@ -161,10 +163,15 @@ class CryptoBot(discord.Client):
                 )
                 return
             daily_channel = daily_channel or market_channel
+            existing = await self.db.get_guild(interaction.guild_id)
+            position_channel_id = (
+                position_channel.id if position_channel else existing.position_channel_id
+            )
             await self.db.update_guild(
                 interaction.guild_id,
                 market_channel_id=market_channel.id,
                 chat_channel_id=chat_channel.id,
+                position_channel_id=position_channel_id,
                 daily_channel_id=daily_channel.id,
                 update_minutes=update_minutes,
                 daily_hour=daily_hour,
@@ -174,7 +181,9 @@ class CryptoBot(discord.Client):
             )
             await interaction.response.send_message(
                 f"✅ 配置完成\n行情：{market_channel.mention}\n日报：{daily_channel.mention}\n"
-                f"聊天：{chat_channel.mention}\n更新：每 {update_minutes} 分钟\n"
+                f"聊天：{chat_channel.mention}\n"
+                f"持仓：{self._channel_text(position_channel_id)}\n"
+                f"更新：每 {update_minutes} 分钟\n"
                 f"日报：{daily_hour:02d}:00（{timezone}）",
                 ephemeral=True,
             )
