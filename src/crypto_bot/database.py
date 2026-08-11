@@ -20,6 +20,13 @@ class GuildConfig:
     market_message_id: int | None = None
     last_market_at: str | None = None
     last_daily_date: str | None = None
+    steam_channel_id: int | None = None
+    steam_highlight_channel_id: int | None = None
+    steam_interval_hours: int = 6
+    steam_min_discount: int = 30
+    steam_pin_highlights: bool = True
+    steam_highlight_message_id: int | None = None
+    last_steam_at: str | None = None
 
 
 @dataclass(slots=True)
@@ -71,7 +78,14 @@ class Database:
                     timezone TEXT NOT NULL DEFAULT 'Asia/Shanghai',
                     market_message_id INTEGER,
                     last_market_at TEXT,
-                    last_daily_date TEXT
+                    last_daily_date TEXT,
+                    steam_channel_id INTEGER,
+                    steam_highlight_channel_id INTEGER,
+                    steam_interval_hours INTEGER NOT NULL DEFAULT 6,
+                    steam_min_discount INTEGER NOT NULL DEFAULT 30,
+                    steam_pin_highlights INTEGER NOT NULL DEFAULT 1,
+                    steam_highlight_message_id INTEGER,
+                    last_steam_at TEXT
                 );
 
                 CREATE TABLE IF NOT EXISTS daily_snapshot (
@@ -117,16 +131,38 @@ class Database:
                     created_at TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS steam_notification (
+                    guild_id INTEGER NOT NULL,
+                    app_id INTEGER NOT NULL,
+                    discount_percent INTEGER NOT NULL,
+                    final_price TEXT NOT NULL,
+                    notified_at TEXT NOT NULL,
+                    PRIMARY KEY (guild_id, app_id)
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_alert_active ON price_alert(active);
                 CREATE INDEX IF NOT EXISTS idx_chat_channel ON chat_message(channel_id, id DESC);
                 CREATE INDEX IF NOT EXISTS idx_position_user
                     ON position(guild_id, user_id, id);
+                CREATE INDEX IF NOT EXISTS idx_steam_notification_time
+                    ON steam_notification(guild_id, notified_at);
                 """
             )
             cursor = await db.execute("PRAGMA table_info(guild_config)")
             columns = {row[1] for row in await cursor.fetchall()}
-            if "position_channel_id" not in columns:
-                await db.execute("ALTER TABLE guild_config ADD COLUMN position_channel_id INTEGER")
+            migrations = {
+                "position_channel_id": "INTEGER",
+                "steam_channel_id": "INTEGER",
+                "steam_highlight_channel_id": "INTEGER",
+                "steam_interval_hours": "INTEGER NOT NULL DEFAULT 6",
+                "steam_min_discount": "INTEGER NOT NULL DEFAULT 30",
+                "steam_pin_highlights": "INTEGER NOT NULL DEFAULT 1",
+                "steam_highlight_message_id": "INTEGER",
+                "last_steam_at": "TEXT",
+            }
+            for name, definition in migrations.items():
+                if name not in columns:
+                    await db.execute(f"ALTER TABLE guild_config ADD COLUMN {name} {definition}")
             await db.commit()
 
     def connect(self) -> aiosqlite.Connection:
@@ -145,13 +181,19 @@ class Database:
                 await db.execute("SELECT * FROM guild_config WHERE guild_id = ?", (guild_id,))
             ).fetchone()
         assert row is not None
-        return GuildConfig(**dict(row))
+        return self._guild_config(row)
 
     async def list_guilds(self) -> list[GuildConfig]:
         async with self.connect() as db:
             db.row_factory = aiosqlite.Row
             rows = await (await db.execute("SELECT * FROM guild_config")).fetchall()
-        return [GuildConfig(**dict(row)) for row in rows]
+        return [self._guild_config(row) for row in rows]
+
+    @staticmethod
+    def _guild_config(row: aiosqlite.Row) -> GuildConfig:
+        data = dict(row)
+        data["steam_pin_highlights"] = bool(data.get("steam_pin_highlights", 1))
+        return GuildConfig(**data)
 
     async def update_guild(self, guild_id: int, **fields: object) -> None:
         allowed = {
@@ -165,6 +207,13 @@ class Database:
             "market_message_id",
             "last_market_at",
             "last_daily_date",
+            "steam_channel_id",
+            "steam_highlight_channel_id",
+            "steam_interval_hours",
+            "steam_min_discount",
+            "steam_pin_highlights",
+            "steam_highlight_message_id",
+            "last_steam_at",
         }
         unknown = set(fields) - allowed
         if unknown:
@@ -369,3 +418,69 @@ class Database:
             )
             await db.commit()
             return cursor.rowcount > 0
+
+    async def steam_deals_to_notify(
+        self,
+        guild_id: int,
+        deals: list[tuple[int, int, str]],
+        repeat_after_days: int = 7,
+    ) -> set[int]:
+        if not deals:
+            return set()
+        app_ids = [item[0] for item in deals]
+        placeholders = ", ".join("?" for _ in app_ids)
+        async with self.connect() as db:
+            db.row_factory = aiosqlite.Row
+            rows = await (
+                await db.execute(
+                    f"""SELECT app_id, discount_percent, final_price, notified_at
+                        FROM steam_notification
+                        WHERE guild_id = ? AND app_id IN ({placeholders})""",  # noqa: S608
+                    (guild_id, *app_ids),
+                )
+            ).fetchall()
+        existing = {int(row["app_id"]): row for row in rows}
+        cutoff = datetime.now(UTC).timestamp() - repeat_after_days * 86_400
+        result: set[int] = set()
+        for app_id, discount_percent, final_price in deals:
+            row = existing.get(app_id)
+            if row is None:
+                result.add(app_id)
+                continue
+            try:
+                notified_at = datetime.fromisoformat(str(row["notified_at"])).timestamp()
+            except ValueError:
+                notified_at = 0
+            changed = (
+                int(row["discount_percent"]) != discount_percent
+                or str(row["final_price"]) != final_price
+            )
+            if changed or notified_at <= cutoff:
+                result.add(app_id)
+        return result
+
+    async def mark_steam_deals_notified(
+        self, guild_id: int, deals: list[tuple[int, int, str]]
+    ) -> None:
+        if not deals:
+            return
+        now = datetime.now(UTC).isoformat()
+        async with self.connect() as db:
+            await db.executemany(
+                """INSERT OR REPLACE INTO steam_notification
+                   (guild_id, app_id, discount_percent, final_price, notified_at)
+                   VALUES (?, ?, ?, ?, ?)""",
+                [
+                    (guild_id, app_id, discount_percent, final_price, now)
+                    for app_id, discount_percent, final_price in deals
+                ],
+            )
+            await db.execute(
+                "DELETE FROM steam_notification WHERE guild_id = ? AND notified_at < ?",
+                (
+                    guild_id,
+                    datetime.fromtimestamp(datetime.now(UTC).timestamp() - 90 * 86_400, UTC)
+                    .isoformat(),
+                ),
+            )
+            await db.commit()

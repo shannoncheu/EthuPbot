@@ -15,6 +15,7 @@ from .config import Settings
 from .database import Database, GuildConfig
 from .market import CoinGeckoClient, EtherscanClient, GateClient, MarketError, extract_gate_symbols
 from .positions import ParsedPosition, calculate_pnl, parse_position_message
+from .steam import SteamClient, SteamDeal, SteamError
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +56,7 @@ class CryptoBot(discord.Client):
         self.market = CoinGeckoClient(settings.coingecko_api_key)
         self.gate = GateClient()
         self.etherscan = EtherscanClient(settings.etherscan_api_key)
+        self.steam = SteamClient()
         self.chat = ChatService(
             settings.ai_api_key,
             settings.ai_base_url,
@@ -64,12 +66,14 @@ class CryptoBot(discord.Client):
         )
         self._synced = False
         self._chat_cooldowns: dict[tuple[int, int], datetime] = {}
+        self._steam_retry_after: dict[int, datetime] = {}
         self._register_commands()
 
     async def setup_hook(self) -> None:
         await self.db.initialize()
         await self.market.start()
         await self.gate.start()
+        await self.steam.start()
         self.scheduler.start()
 
     async def on_ready(self) -> None:
@@ -83,6 +87,7 @@ class CryptoBot(discord.Client):
             self.scheduler.cancel()
         await self.market.close()
         await self.gate.close()
+        await self.steam.close()
         await super().close()
 
     async def on_guild_join(self, guild: discord.Guild) -> None:
@@ -187,6 +192,99 @@ class CryptoBot(discord.Client):
                 f"日报：{daily_hour:02d}:00（{timezone}）",
                 ephemeral=True,
             )
+
+        @self.tree.command(name="steam_setup", description="配置 Steam 折扣自动推送（管理员）")
+        @app_commands.describe(
+            deals_channel="普通折扣推送频道",
+            highlight_channel="好评如潮/热门精选频道，留空则与普通推送相同",
+            interval_hours="自动检查间隔，1-24 小时",
+            min_discount="最低折扣百分比，例如 30 表示至少七折",
+            pin_highlights="是否尝试置顶精选消息，需要管理消息权限",
+        )
+        @app_commands.default_permissions(manage_guild=True)
+        async def steam_setup_command(
+            interaction: discord.Interaction,
+            deals_channel: discord.TextChannel,
+            highlight_channel: discord.TextChannel | None = None,
+            interval_hours: app_commands.Range[int, 1, 24] = 6,
+            min_discount: app_commands.Range[int, 1, 100] = 30,
+            pin_highlights: bool = True,
+        ) -> None:
+            if not interaction.guild_id:
+                await interaction.response.send_message(
+                    "该指令只能在服务器中使用。", ephemeral=True
+                )
+                return
+            highlight_channel = highlight_channel or deals_channel
+            await interaction.response.defer(ephemeral=True)
+            await self.db.update_guild(
+                interaction.guild_id,
+                steam_channel_id=deals_channel.id,
+                steam_highlight_channel_id=highlight_channel.id,
+                steam_interval_hours=interval_hours,
+                steam_min_discount=min_discount,
+                steam_pin_highlights=pin_highlights,
+                steam_highlight_message_id=None,
+                last_steam_at=None,
+            )
+            config = await self.db.get_guild(interaction.guild_id)
+            try:
+                regular_count, highlight_count = await self._post_steam(config, force=True)
+                result = (
+                    f"已立即推送 {regular_count} 款折扣游戏，"
+                    f"精选 {highlight_count} 款。"
+                )
+            except SteamError as exc:
+                result = f"配置已保存，但首次读取 Steam 失败：{exc}"
+            pin_note = "；精选会尝试置顶" if pin_highlights else ""
+            await interaction.followup.send(
+                f"✅ Steam 推送已配置\n"
+                f"普通优惠：{deals_channel.mention}\n"
+                f"精选提醒：{highlight_channel.mention}{pin_note}\n"
+                f"最低折扣：{min_discount}% · 每 {interval_hours} 小时检查\n"
+                f"{result}",
+                ephemeral=True,
+            )
+
+        @self.tree.command(name="steam_now", description="立即刷新 Steam 折扣推送（管理员）")
+        @app_commands.default_permissions(manage_guild=True)
+        async def steam_now_command(interaction: discord.Interaction) -> None:
+            if not interaction.guild_id:
+                await interaction.response.send_message(
+                    "该指令只能在服务器中使用。", ephemeral=True
+                )
+                return
+            config = await self.db.get_guild(interaction.guild_id)
+            if not config.steam_channel_id:
+                await interaction.response.send_message(
+                    "请先使用 `/steam_setup` 设置推送频道。", ephemeral=True
+                )
+                return
+            await interaction.response.defer(ephemeral=True)
+            try:
+                regular_count, highlight_count = await self._post_steam(config, force=True)
+                await interaction.followup.send(
+                    f"✅ 已推送 {regular_count} 款折扣游戏，精选 {highlight_count} 款。",
+                    ephemeral=True,
+                )
+            except SteamError as exc:
+                await interaction.followup.send(f"⚠️ {exc}", ephemeral=True)
+
+        @self.tree.command(name="steam_disable", description="关闭 Steam 自动推送（管理员）")
+        @app_commands.default_permissions(manage_guild=True)
+        async def steam_disable_command(interaction: discord.Interaction) -> None:
+            if not interaction.guild_id:
+                await interaction.response.send_message(
+                    "该指令只能在服务器中使用。", ephemeral=True
+                )
+                return
+            await self.db.update_guild(
+                interaction.guild_id,
+                steam_channel_id=None,
+                steam_highlight_channel_id=None,
+                last_steam_at=None,
+            )
+            await interaction.response.send_message("✅ Steam 自动推送已关闭。", ephemeral=True)
 
         @self.tree.command(name="price", description="查询 Gate USDT 永续合约价格")
         @app_commands.describe(coin="Gate 币种，例如 BTC、BLESS、KORU")
@@ -449,6 +547,11 @@ class CryptoBot(discord.Client):
                 f"日报频道：{self._channel_text(config.daily_channel_id)}\n"
                 f"聊天频道：{self._channel_text(config.chat_channel_id)}\n"
                 f"持仓频道：{self._channel_text(config.position_channel_id)}\n"
+                f"Steam 优惠：{self._channel_text(config.steam_channel_id)}\n"
+                f"Steam 精选：{self._channel_text(config.steam_highlight_channel_id)}"
+                f"（{'置顶' if config.steam_pin_highlights else '不置顶'}）\n"
+                f"Steam 条件：至少 {config.steam_min_discount}% 折扣，"
+                f"每 {config.steam_interval_hours} 小时\n"
                 f"行情间隔：{config.update_minutes} 分钟\n"
                 f"日报时间：{config.daily_hour:02d}:00（{config.timezone}）\n"
                 f"AI：{'已配置' if self.settings.ai_api_key else '未配置'}"
@@ -456,6 +559,158 @@ class CryptoBot(discord.Client):
                 f"Gas：{'已配置' if self.settings.etherscan_api_key else '未配置'}",
                 ephemeral=True,
             )
+
+    @staticmethod
+    def _steam_review_text(deal: SteamDeal) -> str:
+        labels = {
+            "Overwhelmingly Positive": "好评如潮",
+            "Very Positive": "特别好评",
+            "Positive": "好评",
+            "Mostly Positive": "多半好评",
+            "Mixed": "褒贬不一",
+            "Mostly Negative": "多半差评",
+            "Very Negative": "特别差评",
+            "Overwhelmingly Negative": "差评如潮",
+        }
+        label = labels.get(deal.review_label, deal.review_label)
+        if deal.total_reviews <= 0:
+            return label
+        positive = deal.positive_percent
+        percent_text = f" · {positive}% 好评" if positive is not None else ""
+        return f"{label}{percent_text} · {deal.total_reviews:,} 篇评价"
+
+    def _steam_deal_value(self, deal: SteamDeal) -> str:
+        return (
+            f"~~{deal.original_price}~~ → **{deal.final_price}**\n"
+            f"{self._steam_review_text(deal)}\n"
+            f"[打开 Steam 商店]({deal.url})"
+        )
+
+    def _steam_deals_embed(self, deals: list[SteamDeal]) -> discord.Embed:
+        embed = discord.Embed(
+            title="🎮 Steam 新优惠",
+            description="符合设置条件且本轮新发现或折扣发生变化的游戏。",
+            color=0x1B2838,
+            timestamp=datetime.now(UTC),
+        )
+        for deal in deals[:8]:
+            embed.add_field(
+                name=f"-{deal.discount_percent}% · {deal.name}"[:256],
+                value=self._steam_deal_value(deal),
+                inline=False,
+            )
+        if deals and deals[0].image_url:
+            embed.set_thumbnail(url=deals[0].image_url)
+        embed.set_footer(text="数据来源：Steam · 商店价格以结算页面为准")
+        return embed
+
+    def _steam_highlights_embed(self, deals: list[SteamDeal]) -> discord.Embed:
+        embed = discord.Embed(
+            title="🏆 Steam 好评与热门折扣精选",
+            description=(
+                "金色精选：Steam 标记为“好评如潮”，或公开评价量达到 20,000。"
+                "评价量仅用作热度参考，不代表官方销量。"
+            ),
+            color=0xF5C542,
+            timestamp=datetime.now(UTC),
+        )
+        for deal in deals[:6]:
+            badges: list[str] = []
+            if deal.is_overwhelmingly_positive:
+                badges.append("🏆 好评如潮")
+            if deal.is_hot():
+                badges.append("🔥 热门")
+            embed.add_field(
+                name=f"{' · '.join(badges)} · {deal.name}"[:256],
+                value=(
+                    f"**-{deal.discount_percent}%** · ~~{deal.original_price}~~ → "
+                    f"**{deal.final_price}**\n{self._steam_review_text(deal)}\n"
+                    f"[立即查看]({deal.url})"
+                ),
+                inline=False,
+            )
+        if deals and deals[0].image_url:
+            embed.set_thumbnail(url=deals[0].image_url)
+        embed.set_footer(text="自动更新同一条精选消息 · 数据来源：Steam")
+        return embed
+
+    async def _upsert_steam_highlights(
+        self,
+        config: GuildConfig,
+        channel: discord.TextChannel,
+        deals: list[SteamDeal],
+    ) -> None:
+        embed = self._steam_highlights_embed(deals)
+        message: discord.Message | None = None
+        if config.steam_highlight_message_id:
+            try:
+                message = await channel.fetch_message(config.steam_highlight_message_id)
+                await message.edit(embed=embed)
+            except discord.NotFound:
+                message = None
+        if message is None:
+            message = await channel.send(embed=embed)
+            await self.db.update_guild(
+                config.guild_id, steam_highlight_message_id=message.id
+            )
+        if config.steam_pin_highlights and not message.pinned:
+            try:
+                await message.pin(reason="Steam 好评与热门折扣精选")
+            except discord.Forbidden:
+                logger.warning(
+                    "服务器 %s 无法置顶 Steam 精选消息：缺少管理消息权限",
+                    config.guild_id,
+                )
+
+    async def _post_steam(self, config: GuildConfig, force: bool = False) -> tuple[int, int]:
+        channel = self.get_channel(config.steam_channel_id or 0)
+        if not isinstance(channel, discord.TextChannel):
+            raise SteamError("Steam 普通推送频道不存在或机器人无法访问。")
+        deals = await self.steam.deals(config.steam_min_discount, limit=20)
+        if not deals:
+            raise SteamError(f"暂未找到折扣达到 {config.steam_min_discount}% 的游戏。")
+
+        deal_keys = [
+            (deal.app_id, deal.discount_percent, deal.final_price) for deal in deals
+        ]
+        if force:
+            regular = deals[:8]
+        else:
+            notify_ids = await self.db.steam_deals_to_notify(config.guild_id, deal_keys)
+            regular = [deal for deal in deals if deal.app_id in notify_ids][:8]
+        if regular:
+            await channel.send(embed=self._steam_deals_embed(regular))
+            await self.db.mark_steam_deals_notified(
+                config.guild_id,
+                [
+                    (deal.app_id, deal.discount_percent, deal.final_price)
+                    for deal in regular
+                ],
+            )
+
+        highlights = [
+            deal
+            for deal in deals
+            if deal.is_overwhelmingly_positive or deal.is_hot()
+        ]
+        highlights.sort(
+            key=lambda deal: (
+                deal.is_overwhelmingly_positive,
+                deal.total_reviews,
+                deal.discount_percent,
+            ),
+            reverse=True,
+        )
+        highlight_channel = self.get_channel(
+            config.steam_highlight_channel_id or config.steam_channel_id or 0
+        )
+        if highlights and isinstance(highlight_channel, discord.TextChannel):
+            await self._upsert_steam_highlights(config, highlight_channel, highlights[:6])
+
+        await self.db.update_guild(
+            config.guild_id, last_steam_at=datetime.now(UTC).isoformat()
+        )
+        return len(regular), min(len(highlights), 6)
 
     def _channel_text(self, channel_id: int | None) -> str:
         return f"<#{channel_id}>" if channel_id else "未设置"
@@ -640,6 +895,20 @@ class CryptoBot(discord.Client):
             and config.last_daily_date != today
         ):
             await self._post_daily(config, today)
+
+        due_steam = config.steam_channel_id and (
+            not config.last_steam_at
+            or now_utc - datetime.fromisoformat(config.last_steam_at)
+            >= timedelta(hours=config.steam_interval_hours)
+        )
+        retry_after = self._steam_retry_after.get(config.guild_id)
+        if due_steam and (retry_after is None or now_utc >= retry_after):
+            try:
+                await self._post_steam(config)
+                self._steam_retry_after.pop(config.guild_id, None)
+            except SteamError as exc:
+                self._steam_retry_after[config.guild_id] = now_utc + timedelta(minutes=15)
+                logger.warning("服务器 %s 的 Steam 推送失败：%s", config.guild_id, exc)
 
     async def _post_market(self, config: GuildConfig) -> None:
         channel = self.get_channel(config.market_channel_id or 0)
