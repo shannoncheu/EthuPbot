@@ -1,6 +1,6 @@
 # EthuPbot
 
-一个按频道分工的 Discord Bot：使用 Gate USDT 永续合约价格自动更新 BTC/ETH 行情、发送每日同一时刻对比、提供价格提醒和走势图，并在指定聊天频道中进行 AI 对话。
+一个按频道分工的 Discord Bot：使用 Gate USDT 永续合约价格自动更新 BTC/ETH 行情、发送每日同一时刻对比、提供价格提醒和走势图、推送 Steam 折扣游戏，并在指定聊天频道中进行 AI 对话。
 
 ## 已实现功能
 
@@ -16,6 +16,9 @@
 - 持仓频道：记录多单/空单、数量、入场价和杠杆，按 Gate 标记价查询实时盈亏。
 - `/position_channel`、`/position_add`、`/positions`、`/position_delete`：管理持仓收益。
 - `/bot_status`、`/chat_clear`：查看状态与清理 AI 上下文。
+- Steam 优惠：定时推送新发现或折扣变化的游戏，避免重复刷屏。
+- Steam 精选：将“好评如潮”或评价量很高的折扣游戏显示为金色精选消息，并可维护为一条置顶消息。
+- `/steam_setup`、`/steam_now`、`/steam_disable`：配置、立即刷新或关闭 Steam 推送。
 - SQLite 持久化；密钥仅从环境变量读取。
 
 ## 1. 创建 Discord Bot
@@ -26,6 +29,7 @@
 4. 在 **OAuth2 → URL Generator** 选择：
    - Scopes：`bot`、`applications.commands`
    - Bot Permissions：`View Channels`、`Send Messages`、`Embed Links`、`Attach Files`、`Read Message History`
+   - 若要自动置顶 Steam 精选消息，再授予 `Manage Messages`
 5. 用生成的 URL 将 Bot 邀请进服务器。
 
 不要在聊天、截图或 Git 仓库中公开 Token。若 Token 泄露，立即在 Developer Portal 重置。
@@ -92,6 +96,9 @@ docker compose logs -f bot
 /position_add coin:KORU entry_price:0.02 quantity:1000 direction:多单 leverage:10 market:USDT永续合约
 /positions
 /position_delete position_id:1
+/steam_setup deals_channel:#steam优惠 highlight_channel:#steam精选 interval_hours:6 min_discount:30 pin_highlights:true
+/steam_now
+/steam_disable
 ```
 
 设置持仓频道后，也可以直接发送：
@@ -107,6 +114,10 @@ docker compose logs -f bot
 - 整体市场与走势图：CoinGecko Demo API。
 - Gas 数据：Etherscan API V2。
 - AI：Sub2API，支持 OpenAI 兼容的 Chat Completions 和 Responses 两种模式。
+- Steam 优惠与用户评价：Steam Store 公开页面和评价摘要接口，无需额外 API Key。
+- Steam 不公开购买人数；Bot 使用公开评价量作为热度参考。默认评价量达到 20,000，或 Steam 评价为“好评如潮”时进入金色精选。
+- 普通优惠只在首次发现、折扣/价格变化或距离上次提醒超过 7 天时再次推送；管理员可用 `/steam_now` 强制刷新。
+- 精选消息始终编辑同一条；启用置顶时需要机器人拥有 `Manage Messages` 权限。
 - Discord 短期聊天上下文保存在本地 SQLite，每个频道最多保留 20 条消息。
 - 行情播报会编辑原消息；若原消息被删除，Bot 会创建新消息。
 - 价格提醒触发一次后自动停用，避免价格反复穿越目标造成刷屏。
