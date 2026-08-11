@@ -36,5 +36,8 @@ async def test_bot_registers_expected_commands(tmp_path: Path) -> None:
         "position_add",
         "positions",
         "position_delete",
+        "steam_setup",
+        "steam_now",
+        "steam_disable",
     } <= names
     await bot.close()
