@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from math import isfinite
 
 
 @dataclass(frozen=True, slots=True)
@@ -48,8 +49,29 @@ def calculate_pnl(
     leverage: float,
     direction: str,
 ) -> tuple[float, float, float]:
+    values = (entry_price, current_price, quantity, leverage)
+    if not all(isfinite(value) for value in values):
+        raise ValueError("持仓数值必须是有限数字。")
+    if entry_price <= 0 or current_price <= 0 or quantity <= 0 or leverage <= 0:
+        raise ValueError("价格、数量和杠杆必须大于 0。")
+    if direction not in {"long", "short"}:
+        raise ValueError("持仓方向必须是 long 或 short。")
     sign = 1 if direction == "long" else -1
     pnl = (current_price - entry_price) * quantity * sign
     margin = entry_price * quantity / leverage
+    if not isfinite(pnl) or not isfinite(margin) or margin <= 0:
+        raise ValueError("持仓计算结果超出有效范围。")
     roi = pnl / margin * 100
+    if not isfinite(roi):
+        raise ValueError("持仓收益率超出有效范围。")
     return pnl, margin, roi
+
+
+def calculate_portfolio_totals(
+    valuations: list[tuple[float, float]],
+) -> tuple[float, float, float]:
+    """Return total unrealized PnL, total margin and margin-weighted ROI."""
+    total_pnl = sum(pnl for pnl, _ in valuations)
+    total_margin = sum(margin for _, margin in valuations)
+    total_roi = total_pnl / total_margin * 100 if total_margin > 0 else 0.0
+    return total_pnl, total_margin, total_roi

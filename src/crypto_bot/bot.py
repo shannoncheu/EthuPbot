@@ -13,8 +13,20 @@ from .ai import AIUnavailable, ChatService
 from .charts import render_price_chart
 from .config import Settings
 from .database import Database, GuildConfig
-from .market import CoinGeckoClient, EtherscanClient, GateClient, MarketError, extract_gate_symbols
-from .positions import ParsedPosition, calculate_pnl, parse_position_message
+from .market import (
+    CoinGeckoClient,
+    EtherscanClient,
+    GateClient,
+    MarketError,
+    extract_gate_symbols,
+    is_market_question,
+)
+from .positions import (
+    ParsedPosition,
+    calculate_pnl,
+    calculate_portfolio_totals,
+    parse_position_message,
+)
 from .steam import SteamClient, SteamDeal, SteamError
 
 logger = logging.getLogger(__name__)
@@ -66,6 +78,7 @@ class CryptoBot(discord.Client):
         )
         self._synced = False
         self._chat_cooldowns: dict[tuple[int, int], datetime] = {}
+        self._chat_symbols: dict[tuple[int, int], tuple[datetime, list[str]]] = {}
         self._steam_retry_after: dict[int, datetime] = {}
         self._register_commands()
 
@@ -120,9 +133,30 @@ class CryptoBot(discord.Client):
         try:
             async with message.channel.typing():
                 requested = extract_gate_symbols(content)
-                live = await self.gate.coin_markets(requested or ["BTC", "ETH"])
+                market_intent = bool(requested) or is_market_question(content)
+                market_error: str | None = None
+                live: dict[str, dict[str, object]] = {}
+                if requested:
+                    self._chat_symbols[key] = (now, requested)
+                elif market_intent:
+                    recent = self._chat_symbols.get(key)
+                    if recent and now - recent[0] <= timedelta(minutes=30):
+                        requested = recent[1]
+
+                if market_intent and requested:
+                    try:
+                        live = await self.gate.market_analyses(requested)
+                    except MarketError as exc:
+                        market_error = str(exc)
+                        logger.warning("Gate AI 行情查询失败：%s", exc)
+                elif market_intent:
+                    market_error = "没有识别到交易代码，请写成 LAB/USDT 或 $LAB。"
                 answer = await self.chat.reply(
-                    message.channel.id, message.author.display_name, content, live
+                    message.channel.id,
+                    message.author.display_name,
+                    content,
+                    live,
+                    market_error,
                 )
             await message.reply(answer[:2000], mention_author=False)
         except AIUnavailable as exc:
@@ -532,6 +566,11 @@ class CryptoBot(discord.Client):
             if not interaction.channel_id:
                 return
             await self.db.clear_chat(interaction.channel_id)
+            self._chat_symbols = {
+                key: value
+                for key, value in self._chat_symbols.items()
+                if key[0] != interaction.channel_id
+            }
             await interaction.response.send_message("✅ AI 对话上下文已清除。", ephemeral=True)
 
         @self.tree.command(name="bot_status", description="查看 Bot 配置状态")
@@ -724,6 +763,8 @@ class CryptoBot(discord.Client):
     ) -> tuple[int, dict[str, object]]:
         if not (parsed.entry_price > 0 and parsed.quantity > 0 and 1 <= parsed.leverage <= 125):
             raise MarketError("开仓价和数量必须大于 0，杠杆必须为 1-125 倍。")
+        if market_type == "spot" and (parsed.leverage != 1 or parsed.direction != "long"):
+            raise MarketError("现货持仓仅支持 1x 多单；杠杆或空单请使用 USDT 永续。")
         item = await self.gate.ticker(parsed.symbol, market_type)
         position_id = await self.db.add_position(
             guild_id,
@@ -785,30 +826,102 @@ class CryptoBot(discord.Client):
         if not positions:
             embed.description = "你还没有记录持仓。使用 `/position_add` 或直接发送开仓信息。"
             return embed
-        for position in positions[:20]:
+
+        market_keys = list(
+            dict.fromkeys((position.symbol, position.asset_type) for position in positions)
+        )
+        semaphore = asyncio.Semaphore(6)
+
+        async def fetch_market(key: tuple[str, str]) -> dict[str, object]:
+            async with semaphore:
+                return await self.gate.ticker(*key)
+
+        market_values = await asyncio.gather(
+            *(fetch_market(key) for key in market_keys),
+            return_exceptions=True,
+        )
+        market_by_key = dict(zip(market_keys, market_values, strict=True))
+        valuations: list[tuple[float, float]] = []
+        detail_values: list[tuple[object, str]] = []
+
+        for position in positions:
             try:
-                item = await self.gate.ticker(position.symbol, position.asset_type)
+                item = market_by_key[(position.symbol, position.asset_type)]
+                if isinstance(item, MarketError):
+                    raise item
+                if isinstance(item, BaseException):
+                    logger.warning("持仓行情查询异常：%s", item)
+                    raise ValueError("行情查询异常")
+                if not isinstance(item, dict):
+                    raise ValueError("行情格式不正确")
                 current = float(item["current_price"])
+                effective_leverage = (
+                    1.0 if position.asset_type == "spot" else position.leverage
+                )
                 pnl, margin, roi = calculate_pnl(
                     position.entry_price,
                     current,
                     position.quantity,
-                    position.leverage,
+                    effective_leverage,
                     position.direction,
                 )
+                valuations.append((pnl, margin))
                 side = "多" if position.direction == "long" else "空"
                 market = "永续" if position.asset_type == "futures" else "现货"
                 quote = str(item.get("quote_currency", "USDT"))
+                leverage_text = (
+                    f"{effective_leverage:g}x" if position.asset_type == "futures" else "全额现货"
+                )
                 value = (
-                    f"{market} · {side} · {position.leverage:g}x · 数量 {position.quantity:g}\n"
+                    f"{market} · {side} · {leverage_text} · 数量 {position.quantity:g}\n"
                     f"入场 `{position.entry_price:g}` → 现价 `{current:g}` {quote}\n"
                     f"未实现盈亏 **{pnl:+,.4f} {quote}** · 保证金 `{margin:,.4f}`\n"
                     f"保证金收益率 **{roi:+.2f}%**"
                 )
             except MarketError as exc:
-                value = f"暂时无法取得行情：{exc}"
-            embed.add_field(name=f"#{position.id} · {position.symbol}", value=value, inline=False)
-        embed.set_footer(text="Gate 标记价/现货价 · 未计手续费、资金费与滑点 · 不构成投资建议")
+                value = f"暂时无法取得行情，**未计入汇总**：{exc}"
+            except (KeyError, TypeError, ValueError, OverflowError):
+                value = "行情或持仓数值无效，**未计入汇总**。"
+            detail_values.append((position, value))
+
+        priced_count = len(valuations)
+        total_count = len(positions)
+        if valuations:
+            total_pnl, total_margin, total_roi = calculate_portfolio_totals(valuations)
+            icon = "🟢" if total_pnl > 0 else "🔴" if total_pnl < 0 else "🟡"
+            label = "总" if priced_count == total_count else "已计价"
+            title_label = "总计" if priced_count == total_count else "已计价"
+            embed.title = (
+                f"📈 实时持仓收益 · {icon} {title_label} {total_pnl:+,.4f} USDT"
+            )
+            embed.description = (
+                f"## {icon} {label}未实现盈亏\n"
+                f"# **{total_pnl:+,.4f} USDT**\n"
+                f"{label}保证金 **{total_margin:,.4f} USDT** · "
+                f"整体收益率 **{total_roi:+.2f}%**\n"
+                f"已计价 **{priced_count}/{total_count}** 笔持仓"
+            )
+            embed.colour = (
+                0x16C784 if total_pnl > 0 else 0xEA3943 if total_pnl < 0 else 0xF0B90B
+            )
+            if priced_count < total_count:
+                embed.description += "；合计不含无法取价的仓位"
+        else:
+            embed.description = (
+                "## ⚠️ 总收益暂不可计算\n"
+                f"当前 **0/{total_count}** 笔持仓成功取得有效行情。"
+            )
+            embed.colour = 0xF0B90B
+
+        for position, value in detail_values[:20]:
+            embed.add_field(
+                name=f"#{position.id} · {position.symbol}", value=value, inline=False
+            )
+        footer = "Gate 标记价/现货价 · 未计手续费、资金费与滑点"
+        if total_count > 20:
+            footer += f" · 明细仅显示前 20 笔，另有 {total_count - 20} 笔未展开"
+        footer += " · 不构成投资建议"
+        embed.set_footer(text=footer)
         return embed
 
     def _coin_embed(self, item: dict[str, object], currency: str = "usd") -> discord.Embed:
